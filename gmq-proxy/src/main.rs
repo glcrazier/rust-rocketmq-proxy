@@ -1,4 +1,4 @@
-use grocketmq_proxy::service::server::GrpcMessagingServer;
+use gmq_proxy::service::server::GrpcMessagingServer;
 
 #[tokio::main]
 async fn main() {

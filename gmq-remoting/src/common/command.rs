@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{self, Error};
+use crate::util::{vec_to_u32, Error};
 
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -26,16 +26,20 @@ pub struct Command {
 
 impl Command {
     pub fn new(code: u8) -> Self {
+        Self::new_with_header(code, HashMap::new())
+    }
+
+    pub fn new_with_header(code: u8, custom_header: impl Into<HashMap<String, String>>) -> Self {
         Self {
+            body: None,
             header: Header {
                 code,
                 flag: 0,
                 language: 12,
                 opaque: REQUEST_ID.fetch_add(1, Ordering::Relaxed),
                 remark: "".to_string(),
-                ext_fields: HashMap::new(),
-            },
-            body: None,
+                ext_fields: custom_header.into(),
+            }
         }
     }
 
@@ -94,8 +98,8 @@ impl Command {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let length = util::vec_to_u32(&data);
-        let header_length = util::vec_to_u32(&data[4..8]);
+        let length = vec_to_u32(&data);
+        let header_length = vec_to_u32(&data[4..8]);
         let header: Header = serde_json::from_slice(&data[8..8 + header_length as usize])
             .map_err(|_| Error::DecodeCommandError)?;
         Ok(Self {

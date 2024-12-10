@@ -1,5 +1,5 @@
 [package]
-name = "grocketmq-proxy"
+name = "gmq-proxy"
 version = "0.1.0"
 edition = "2021"
 

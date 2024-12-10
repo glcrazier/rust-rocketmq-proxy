@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["grocketmq-proxy", "grocketmq-remoting"]
+members = ["gmq-proxy", "gmq-remoting"]
 
 [workspace.dependencies]
 once_cell = "1.19.0"

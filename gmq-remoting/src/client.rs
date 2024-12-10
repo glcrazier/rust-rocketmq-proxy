@@ -156,7 +156,7 @@ impl Channel {
         }
     }
 
-    pub async fn request(&self, cmd: Command) -> Result<Command, Box<dyn std::error::Error>> {
+    pub async fn request(&self, cmd: Command) -> Result<Command, Error> {
         let (write_tx, write_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
         let request = Request {
@@ -166,17 +166,17 @@ impl Channel {
         };
         let result = self.command_sender.try_send(request);
         if let Err(e) = result {
-            return Err(Box::new(e));
+            return Err(Error::WriteError);
         }
-        if let Err(e) = timeout(self.timeout, write_rx).await {
-            return Err(Box::new(e));
+        if let Err(_) = timeout(self.timeout, write_rx).await {
+            return Err(Error::Timeout);
         }
         match timeout(self.timeout, response_rx).await {
             Ok(response) => match response {
                 Ok(command) => Ok(command),
-                Err(e) => Err(Box::new(e)),
+                Err(e) => Err(Error::ReadError),
             },
-            Err(e) => Err(Box::new(e)),
+            Err(_) => Err(Error::Timeout),
         }
     }
 }

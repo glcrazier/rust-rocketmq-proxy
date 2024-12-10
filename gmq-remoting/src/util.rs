@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use serde_json::error;
 use thiserror::Error;
 
 pub fn vec_to_u32(data: &[u8]) -> u32 {
@@ -19,4 +22,10 @@ pub enum Error {
     StreamNotReady,
     #[error("invalid address {0}")]
     InvalidAddress(String),
+    #[error("request timeout")]
+    Timeout,
+    #[error("read from server error")]
+    ReadError,
+    #[error("write to server error")]
+    WriteError,
 }
