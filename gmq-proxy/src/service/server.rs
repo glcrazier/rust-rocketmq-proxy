@@ -1,11 +1,25 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use async_stream::try_stream;
+use parking_lot::RwLock;
+use tokio_stream::Stream;
 use tonic::transport::Server;
+use tonic::Response;
 
-use crate::pb;
 use crate::pb::messaging_service_server::{MessagingService, MessagingServiceServer};
+use crate::pb::{self, ClientType, Code, Settings, Status, TelemetryCommand};
+use crate::pb::telemetry_command::Command;
 
 pub struct GrpcMessagingServer {}
+
+#[derive(Debug, Clone)]
+pub struct ClientSettingManager {
+    client_settings_map: Arc<RwLock<HashMap<String, Settings>>>,
+
+}
 
 impl GrpcMessagingServer {
     pub fn new() -> Self {
@@ -13,7 +27,7 @@ impl GrpcMessagingServer {
     }
 
     pub async fn start(&mut self) -> Result<(), Box<dyn Error>> {
-        let service_inner = MessagingServiceServer::new(MessagingServer::default());
+        let service_inner = MessagingServiceServer::new(MessagingServer::new());
 
         let addr = "0.0.0.0:8081".parse().unwrap();
         Server::builder()
@@ -25,12 +39,25 @@ impl GrpcMessagingServer {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct MessagingServer {}
+#[derive(Debug)]
+pub struct MessagingServer {
+    setting_manager: ClientSettingManager,
+}
+
+impl MessagingServer {
+
+    pub fn new() -> Self {
+        Self {
+            setting_manager: ClientSettingManager::new(),
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl MessagingService for MessagingServer {
-    type TelemetryStream = tonic::Streaming<pb::TelemetryCommand>;
+
+    type TelemetryStream =
+        Pin<Box<dyn Stream<Item = Result<pb::TelemetryCommand, tonic::Status>> + Send + 'static>>;
     type ReceiveMessageStream = tonic::Streaming<pb::ReceiveMessageResponse>;
     type PullMessageStream = tonic::Streaming<pb::PullMessageResponse>;
     async fn query_assignment(
@@ -119,9 +146,34 @@ impl MessagingService for MessagingServer {
 
     async fn telemetry(
         &self,
-        _request: tonic::Request<tonic::Streaming<pb::TelemetryCommand>>,
+        request: tonic::Request<tonic::Streaming<pb::TelemetryCommand>>,
     ) -> Result<tonic::Response<Self::TelemetryStream>, tonic::Status> {
-        Err(tonic::Status::aborted("not implemented"))
+        let mut stream = request.into_inner();
+        let output = try_stream! {
+            while let Ok(message) = stream.message().await {
+                if let Some(command) = message {
+                    if let Some(command) = command.command {
+                        match command {
+                            Command::Settings(settings) => {
+                                //TODO: add detail implementation.
+                                yield TelemetryCommand {
+                                    status: Some(Status {
+                                        code: Code::Ok as i32,
+                                        message: "ok".to_string(),
+                                    }),
+                                    command: Some(Command::Settings(settings.clone())),
+                                }
+                            }
+                            _ => {
+
+                            }
+                        }
+                    }
+               }
+            }
+            println!("Still working on this command!")
+        };
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn notify_client_termination(
@@ -136,5 +188,18 @@ impl MessagingService for MessagingServer {
         _request: tonic::Request<pb::ChangeInvisibleDurationRequest>,
     ) -> Result<tonic::Response<pb::ChangeInvisibleDurationResponse>, tonic::Status> {
         Err(tonic::Status::aborted("not implemented"))
+    }
+}
+
+impl ClientSettingManager {
+    pub fn new() -> Self {
+        let client_settings_map = Arc::new(RwLock::new(HashMap::new()));
+        ClientSettingManager {
+            client_settings_map,
+        }
+    }
+
+    pub fn add_setting(&mut self, client_id: String, settings: Settings) {
+        self.client_settings_map.write().insert(client_id, settings);
     }
 }
