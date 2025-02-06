@@ -1,10 +1,7 @@
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, time::Duration};
 
 use tokio::{
-    net::{TcpSocket, TcpStream},
-    select,
-    sync::{mpsc, oneshot},
-    time::timeout,
+    io::AsyncWriteExt, net::{TcpSocket, TcpStream}, select, sync::{mpsc, oneshot}, time::timeout
 };
 
 use crate::{
@@ -21,7 +18,6 @@ pub struct Channel {
 
 struct Request {
     commmand: Command,
-    write_tx: oneshot::Sender<Result<(), Error>>,
     response_tx: oneshot::Sender<Command>,
 }
 
@@ -33,7 +29,7 @@ impl Channel {
         let addr = addr
             .parse()
             .map_err(|_| Error::InvalidAddress(addr.to_string()))?;
-        let (tx, mut rx) = mpsc::channel(1024);
+        let (tx, mut request_rx) = mpsc::channel(1024);
         let command_sender: mpsc::Sender<Request> = tx;
         let mut response_table: HashMap<usize, oneshot::Sender<Command>> = HashMap::new();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -43,22 +39,24 @@ impl Channel {
             let mut stream: Option<TcpStream> = None;
             loop {
                 select! {
-                    Some(request) = rx.recv() => {
-                        if stream.is_none() {
-                            stream = Channel::new_stream(addr).await.ok();
+                    Some(request) = async {
+                        if Channel::stream_writable(&stream).await.is_err() {
+                            return None;
                         }
-                        if let Some(stream) = stream.as_mut() {
+                        request_rx.recv().await 
+                    } => {
+                        if let Some(tcp_stream) = stream.as_mut() {
                             let opaque = request.commmand.opaque();
-                            let result = Channel::write(stream, request.commmand).await;
-                            let write_tx = request.write_tx;
-                            if write_tx.send(result).is_ok() {
+                            let result = Channel::write(tcp_stream, request.commmand).await;
+                            if result.is_ok() {
                                 response_table.insert(opaque, request.response_tx);
+                            } else {
+                                let _ = tcp_stream.shutdown().await;
+                                stream.take();
                             }
-                        } else {
-                            let _ = request.write_tx.send(Err(Error::StreamNotReady));
                         }
                     }
-                    Some(_) = Channel::stream_readable(&stream) => {
+                    Ok(_) = Channel::stream_readable(&stream) => {
                         if let Some(stream) = stream.as_mut() {
                             match Channel::read(stream, &mut buf_read).await {
                                 Ok(command) => {
@@ -66,15 +64,23 @@ impl Channel {
                                         let _ = response_tx.send(command);
                                     }
                                 }
-                                Err(_) => {
-
+                                Err(e) => {
+                                    println!("read command error {:?}", e);
                                 }
                             }
                         }
 
                     }
                     _ = &mut shutdown_rx => {
+                        if let Some(tcp_stream) = stream.take().as_mut() {
+                            let _ = tcp_stream.shutdown().await;
+                        }
                         break;
+                    }
+                    else => {
+                        if stream.is_none() {
+                            stream = Channel::new_stream(addr).await.ok();
+                        }
                     }
                 }
             }
@@ -86,11 +92,19 @@ impl Channel {
         })
     }
 
-    async fn stream_readable(stream: &Option<TcpStream>) -> Option<()> {
+    async fn stream_readable(stream: &Option<TcpStream>) -> Result<(), Error> {
         if let Some(stream) = stream {
-            stream.readable().await.ok()
+            stream.readable().await.map_err(|_| Error::StreamNotReady)
         } else {
-            None
+            Err(Error::StreamNotReady)
+        }
+    }
+
+    async fn stream_writable(stream: &Option<TcpStream>) -> Result<(), Error> {
+        if let Some(stream) = stream {
+            stream.writable().await.map_err(|_| Error::StreamNotReady)
+        } else {
+            Err(Error::StreamNotReady)
         }
     }
 
@@ -150,6 +164,8 @@ impl Channel {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         continue;
+                    } else {
+                        return Err(e.into());
                     }
                 }
             }
@@ -157,24 +173,19 @@ impl Channel {
     }
 
     pub async fn request(&self, cmd: Command) -> Result<Command, Error> {
-        let (write_tx, write_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
         let request = Request {
             commmand: cmd,
-            write_tx,
             response_tx,
         };
         let result = self.command_sender.try_send(request);
-        if let Err(e) = result {
+        if result.is_err() {
             return Err(Error::WriteError);
-        }
-        if let Err(_) = timeout(self.timeout, write_rx).await {
-            return Err(Error::Timeout);
         }
         match timeout(self.timeout, response_rx).await {
             Ok(response) => match response {
                 Ok(command) => Ok(command),
-                Err(e) => Err(Error::ReadError),
+                Err(_) => Err(Error::ReadError),
             },
             Err(_) => Err(Error::Timeout),
         }
