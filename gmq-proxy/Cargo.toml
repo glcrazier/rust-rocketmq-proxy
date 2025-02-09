@@ -15,6 +15,9 @@ tonic.workspace = true
 tower.workspace = true
 async-stream.workspace = true
 tokio-stream.workspace = true
+thiserror.workspace = true
+gmq-remoting = { path = "../gmq-remoting" }
+anyhow.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true 

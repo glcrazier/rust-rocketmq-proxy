@@ -25,7 +25,7 @@ struct Request {
  * A channel sends and receives Command messages.
  */
 impl Channel {
-    pub async fn new(addr: &str) -> Result<Self, Error> {
+    pub fn new(addr: &str) -> Result<Self, Error> {
         let addr = addr
             .parse()
             .map_err(|_| Error::InvalidAddress(addr.to_string()))?;
