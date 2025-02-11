@@ -5,20 +5,22 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{vec_to_u32, Error};
+use crate::util::{read_u32, Error};
 
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Header {
     code: u8,
     flag: u8,
-    language: u8,
+    language: String,
     opaque: usize,
-    remark: String,
+    remark: Option<String>,
+    #[serde(default)]
     ext_fields: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Command {
     header: Header,
     body: Option<Vec<u8>>,
@@ -35,11 +37,11 @@ impl Command {
             header: Header {
                 code,
                 flag: 0,
-                language: 12,
+                language: "RUST".to_string(),
                 opaque: REQUEST_ID.fetch_add(1, Ordering::Relaxed),
-                remark: "".to_string(),
+                remark: None,
                 ext_fields: custom_header.into(),
-            }
+            },
         }
     }
 
@@ -68,7 +70,7 @@ impl Command {
     }
 
     pub fn encode(self) -> Vec<u8> {
-        let mut length: u32 = 8;
+        let mut length: u32 = 4;
 
         let header_data = serde_json::to_vec(&self.header).unwrap();
         length = length + header_data.len() as u32;
@@ -77,9 +79,10 @@ impl Command {
         if let Some(body) = ref_body {
             length = length + body.len() as u32;
         }
+        let header_len = (0 << 24) | (header_data.len() & 0x00FFFFFF) as u32;
         let mut result = Vec::with_capacity(4 + length as usize);
-        result.extend(Self::u32_to_vec(length));
-        result.extend(Self::u32_to_vec(header_data.len() as u32));
+        result.extend(length.to_be_bytes());
+        result.extend(header_len.to_be_bytes());
         result.extend(header_data);
         if let Some(body) = self.body {
             result.extend(body);
@@ -88,23 +91,15 @@ impl Command {
         result
     }
 
-    fn u32_to_vec(data: u32) -> Vec<u8> {
-        let mut result = Vec::with_capacity(4);
-        result.push((data >> 24) as u8);
-        result.push((data >> 16) as u8);
-        result.push((data >> 8) as u8);
-        result.push(data as u8);
-        result
-    }
-
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let length = vec_to_u32(&data);
-        let header_length = vec_to_u32(&data[4..8]);
+        let length = read_u32(data);
+        let header_length = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let header: Header = serde_json::from_slice(&data[8..8 + header_length as usize])
-            .map_err(|_| Error::DecodeCommandError)?;
+            .map_err(|e| Error::DecodeCommandError(e.into()))?;
+        let total_length = 4 + length;
         Ok(Self {
             header,
-            body: Some(data[8 + header_length as usize..length as usize].to_vec()),
+            body: Some(data[8 + header_length as usize..total_length as usize].to_vec()),
         })
     }
 }

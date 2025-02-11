@@ -48,7 +48,7 @@ impl MQClient {
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), Error> {
+    pub fn start(&mut self) -> Result<(), Error> {
         let result = Channel::new(&self.addr);
         match result {
             Ok(channel) => {
@@ -65,15 +65,20 @@ impl MQClient {
         if let Some(channel) = self.channel.as_ref() {
             let mut headers = HashMap::new();
             headers.insert("topic".to_string(), topic.to_string());
+            headers.insert("acceptStandardJsonOnly".to_string(), "true".to_string());
             let cmd = Command::new_with_header(RequestCode::GetTopicRouteInfo as u8, headers);
             let result = channel.request(cmd).await;
             match result {
                 Ok(command) => {
                     if let Some(body) = command.body() {
-                        return serde_json::from_slice(body)
-                            .map_err(|e| Error::TopicNotFound(topic.to_string(), e.into()));
+                        return serde_json::from_slice(body).map_err(|e| {
+                            return Error::TopicNotFound(topic.to_string(), e.into());
+                        });
                     } else {
-                        return Err(Error::TopicNotFound(topic.to_string(), anyhow!("invalid command body")));
+                        return Err(Error::TopicNotFound(
+                            topic.to_string(),
+                            anyhow!("no body in response"),
+                        ));
                     }
                 }
                 Err(e) => {

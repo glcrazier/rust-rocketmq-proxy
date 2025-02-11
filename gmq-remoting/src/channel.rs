@@ -1,19 +1,25 @@
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, time::Duration};
 
+use anyhow::anyhow;
 use tokio::{
-    io::AsyncWriteExt, net::{TcpSocket, TcpStream}, select, sync::{mpsc, oneshot}, time::timeout
+    io::AsyncWriteExt,
+    net::{TcpSocket, TcpStream},
+    select,
+    sync::{mpsc, oneshot},
+    time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::command::Command,
-    util::{vec_to_u32, Error},
+    util::{read_u32, Error},
 };
 
 #[derive(Debug)]
 pub struct Channel {
     command_sender: mpsc::Sender<Request>,
     timeout: Duration,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_token: CancellationToken,
 }
 
 struct Request {
@@ -32,8 +38,9 @@ impl Channel {
         let (tx, mut request_rx) = mpsc::channel(1024);
         let command_sender: mpsc::Sender<Request> = tx;
         let mut response_table: HashMap<usize, oneshot::Sender<Command>> = HashMap::new();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let mut buf_read: Vec<u8> = Vec::with_capacity(4096);
+        let token = CancellationToken::new();
+        let shutdown_token = token.clone();
 
         tokio::spawn(async move {
             let mut stream: Option<TcpStream> = None;
@@ -43,7 +50,7 @@ impl Channel {
                         if Channel::stream_writable(&stream).await.is_err() {
                             return None;
                         }
-                        request_rx.recv().await 
+                        request_rx.recv().await
                     } => {
                         if let Some(tcp_stream) = stream.as_mut() {
                             let opaque = request.commmand.opaque();
@@ -66,12 +73,20 @@ impl Channel {
                                 }
                                 Err(e) => {
                                     println!("read command error {:?}", e);
+                                    break;
                                 }
                             }
                         }
 
                     }
-                    _ = &mut shutdown_rx => {
+                    Ok(_) = async {
+                        if token.is_cancelled() {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("not canceled"))
+                        }
+
+                    } => {
                         if let Some(tcp_stream) = stream.take().as_mut() {
                             let _ = tcp_stream.shutdown().await;
                         }
@@ -88,7 +103,7 @@ impl Channel {
         Ok(Self {
             command_sender,
             timeout: Duration::from_secs(10),
-            shutdown_tx,
+            shutdown_token,
         })
     }
 
@@ -109,6 +124,7 @@ impl Channel {
     }
 
     async fn new_stream(addr: SocketAddr) -> Result<TcpStream, Error> {
+        println!("create new stream with {:?}", addr);
         let socket = TcpSocket::new_v4()?;
         socket.set_nodelay(true)?;
         let stream = socket.connect(addr).await?;
@@ -152,18 +168,18 @@ impl Channel {
                     if read_buf.len() < 4 {
                         continue;
                     }
-                    let length_field = &read_buf[0..4];
-                    let length = vec_to_u32(length_field);
+                    let length = read_u32(&read_buf);
                     if read_buf.len() < length as usize {
                         continue;
                     }
+                    let total_length = 4 + length;
 
-                    let buf: Vec<u8> = read_buf.drain(0..length as usize).collect();
+                    let buf: Vec<u8> = read_buf.drain(0..total_length as usize).collect();
                     return Command::decode(&buf);
                 }
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
-                        continue;
+                        return Err(Error::StreamNotReady);
                     } else {
                         return Err(e.into());
                     }
