@@ -1,126 +1,170 @@
-use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::anyhow;
+use parking_lot::RwLock;
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpSocket, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpSocket, TcpStream,
+    },
     select,
     sync::{mpsc, oneshot},
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{
-    common::command::Command,
-    util::{read_u32, Error},
-};
+use crate::{common::command::Command, util::Error};
 
 #[derive(Debug)]
 pub struct Channel {
     command_sender: mpsc::Sender<Request>,
     timeout: Duration,
     shutdown_token: CancellationToken,
+    shutdown_tracker: TaskTracker,
 }
 
 struct Request {
-    commmand: Command,
-    response_tx: oneshot::Sender<Command>,
+    cmd: Command,
+    response_tx: oneshot::Sender<Result<Command, Error>>,
 }
 
 /**
  * A channel sends and receives Command messages.
  */
 impl Channel {
-    pub fn new(addr: &str) -> Result<Self, Error> {
+    pub async fn new(addr: &str) -> Result<Self, Error> {
         let addr = addr
             .parse()
             .map_err(|_| Error::InvalidAddress(addr.to_string()))?;
         let (tx, mut request_rx) = mpsc::channel(1024);
         let command_sender: mpsc::Sender<Request> = tx;
-        let mut response_table: HashMap<usize, oneshot::Sender<Command>> = HashMap::new();
-        let mut buf_read: Vec<u8> = Vec::with_capacity(4096);
+        let response_table: Arc<RwLock<HashMap<usize, oneshot::Sender<Result<Command, Error>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let token = CancellationToken::new();
+
+        let (create_stream_tx, mut create_stream_rx) = mpsc::channel(32);
+        let create_stream_tx: mpsc::Sender<()> = create_stream_tx;
+
+        let (reader_tx, mut reader_rx) = mpsc::channel(32);
+        let reader_tx: mpsc::Sender<OwnedReadHalf> = reader_tx;
+        let (writer_tx, mut writer_rx) = mpsc::channel(32);
+        let writer_tx: mpsc::Sender<OwnedWriteHalf> = writer_tx;
+
         let shutdown_token = token.clone();
 
-        tokio::spawn(async move {
-            let mut stream: Option<TcpStream> = None;
+        let task_tracker = TaskTracker::new();
+        task_tracker.spawn(async move {
             loop {
                 select! {
-                    Some(request) = async {
-                        if Channel::stream_writable(&stream).await.is_err() {
-                            return None;
-                        }
-                        request_rx.recv().await
-                    } => {
-                        if let Some(tcp_stream) = stream.as_mut() {
-                            let opaque = request.commmand.opaque();
-                            let result = Channel::write(tcp_stream, request.commmand).await;
-                            if result.is_ok() {
-                                response_table.insert(opaque, request.response_tx);
-                            } else {
-                                let _ = tcp_stream.shutdown().await;
-                                stream.take();
-                            }
-                        }
-                    }
-                    Ok(_) = Channel::stream_readable(&stream) => {
-                        if let Some(stream) = stream.as_mut() {
-                            match Channel::read(stream, &mut buf_read).await {
-                                Ok(command) => {
-                                    if let Some(response_tx) = response_table.remove(&command.opaque()) {
-                                        let _ = response_tx.send(command);
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("read command error {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-
-                    }
-                    Ok(_) = async {
-                        if token.is_cancelled() {
-                            Ok(())
+                    _ = create_stream_rx.recv() => {
+                        let result = Channel::new_stream(addr).await;
+                        if let Ok(stream) = result {
+                            let (reader, writer) = stream.into_split();
+                            let _reader = reader_tx.send(reader).await;
+                            let _writer = writer_tx.send(writer).await;
                         } else {
-                            Err(anyhow!("not canceled"))
+                            println!("create stream failed: {:?}", result);
                         }
-
-                    } => {
-                        if let Some(tcp_stream) = stream.take().as_mut() {
-                            let _ = tcp_stream.shutdown().await;
-                        }
-                        break;
                     }
-                    else => {
-                        if stream.is_none() {
-                            stream = Channel::new_stream(addr).await.ok();
-                        }
+                    _ = shutdown_token.cancelled() => {
+                        break;
                     }
                 }
             }
         });
+
+        create_stream_tx
+            .send(())
+            .await
+            .map_err(|e| Error::InternalError(e.into()))?;
+
+        let response_table_for_reader = Arc::clone(&response_table);
+        let shutdown_token_2 = token.clone();
+
+        task_tracker.spawn(async move {
+            loop {
+                select! {
+                    Some(mut reader) = reader_rx.recv() => {
+                        loop {
+                            if shutdown_token_2.is_cancelled() {
+                                println!("shutdown reader loop");
+                                break;
+                            }
+                            match Channel::read_command(&mut reader).await {
+                                Ok(command) => {
+                                    // send out command
+                                    let opaque = command.opaque();
+                                    if let Some(sender) = response_table_for_reader.write().remove(&opaque) {
+                                        if let Err(e) = sender.send(Ok(command)) {
+                                            println!("Send response command error: {:?}", e);
+                                        }
+                                    } else {
+                                        println!("no entry of {} in response table, drop command", opaque);
+                                    }
+                                }
+                                Err(Error::TryLater) => {
+                                    // try later
+                                }
+                                Err(e) => {
+                                    println!("read stream encounters error {:?}", e);
+                                    let _ = create_stream_tx.send(()).await;
+                                    break;
+                                }
+                            }
+
+                        }
+                    }
+                    _ = shutdown_token_2.cancelled() => {
+                        println!("shutdown reader task");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let response_table_for_writer = Arc::clone(&response_table);
+        let shutdown_token3 = token.clone();
+
+        task_tracker.spawn(async move {
+            loop {
+                select! {
+                    Some(mut writer) = writer_rx.recv() => {
+                        loop {
+                            select! {
+                                Some(request) = request_rx.recv() => {
+                                    let opaque = request.cmd.opaque();
+                                    match Channel::write_command(&mut writer, request.cmd).await {
+                                        Ok(_) => {
+                                           response_table_for_writer.write().insert(opaque, request.response_tx);
+                                        }
+                                        Err(e) => {
+                                            let _ = request.response_tx.send(Err(e));
+                                        }
+                                    }
+                                }
+                                _ = shutdown_token3.cancelled() => {
+                                    println!("shutdown write loop");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown_token3.cancelled() => {
+                        println!("shutdown writer task");
+                        break;
+                    }
+                }
+            }
+        });
+        
+        task_tracker.close();
+
         Ok(Self {
             command_sender,
             timeout: Duration::from_secs(10),
-            shutdown_token,
+            shutdown_token: token.clone(),
+            shutdown_tracker: task_tracker,
         })
-    }
-
-    async fn stream_readable(stream: &Option<TcpStream>) -> Result<(), Error> {
-        if let Some(stream) = stream {
-            stream.readable().await.map_err(|_| Error::StreamNotReady)
-        } else {
-            Err(Error::StreamNotReady)
-        }
-    }
-
-    async fn stream_writable(stream: &Option<TcpStream>) -> Result<(), Error> {
-        if let Some(stream) = stream {
-            stream.writable().await.map_err(|_| Error::StreamNotReady)
-        } else {
-            Err(Error::StreamNotReady)
-        }
     }
 
     async fn new_stream(addr: SocketAddr) -> Result<TcpStream, Error> {
@@ -131,79 +175,49 @@ impl Channel {
         Ok(stream)
     }
 
-    async fn write(stream: &mut TcpStream, cmd: Command) -> Result<(), Error> {
-        let encoded_data = cmd.encode();
-        let len = encoded_data.len();
-        let mut written_bytes = 0;
-        loop {
-            stream.writable().await?;
-            let raw_bytes = &encoded_data[written_bytes..len];
-            match stream.try_write(raw_bytes) {
-                Ok(n) => {
-                    written_bytes += n;
-                    if written_bytes == len {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            }
+    async fn read_command(reader: &mut OwnedReadHalf) -> Result<Command, Error> {
+        let mut frame_length_bytes = [0; 4];
+        if reader.peek(&mut frame_length_bytes).await? != 4 {
+            return Err(Error::TryLater);
         }
-        Ok(())
+        let frame_length = 4 + u32::from_be_bytes(frame_length_bytes) as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(frame_length);
+
+        while buf.len() < frame_length {
+            reader.read_buf(&mut buf).await?;
+        }
+
+        return Command::decode_vec(buf);
     }
 
-    async fn read(stream: &mut TcpStream, read_buf: &mut Vec<u8>) -> Result<Command, Error> {
-        loop {
-            match stream.try_read_buf(read_buf) {
-                Ok(0) => {
-                    return Err(
-                        std::io::Error::new(ErrorKind::UnexpectedEof, "unexpected eof").into(),
-                    );
-                }
-                Ok(_) => {
-                    if read_buf.len() < 4 {
-                        continue;
-                    }
-                    let length = read_u32(&read_buf);
-                    if read_buf.len() < length as usize {
-                        continue;
-                    }
-                    let total_length = 4 + length;
-
-                    let buf: Vec<u8> = read_buf.drain(0..total_length as usize).collect();
-                    return Command::decode(&buf);
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        return Err(Error::StreamNotReady);
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
+    async fn write_command(writer: &mut OwnedWriteHalf, cmd: Command) -> Result<(), Error> {
+        let mut raw_data = cmd.encode();
+        let _ = writer
+            .write_all(&mut raw_data)
+            .await
+            .map_err(|e| Error::WriteError)?;
+        Ok(())
     }
 
     pub async fn request(&self, cmd: Command) -> Result<Command, Error> {
         let (response_tx, response_rx) = oneshot::channel();
-        let request = Request {
-            commmand: cmd,
-            response_tx,
-        };
+        let request = Request { cmd, response_tx };
         let result = self.command_sender.try_send(request);
-        if result.is_err() {
+        if let Err(_) = result {
             return Err(Error::WriteError);
         }
         match timeout(self.timeout, response_rx).await {
             Ok(response) => match response {
-                Ok(command) => Ok(command),
+                Ok(Ok(command)) => Ok(command),
+                Ok(Err(e)) => Err(e),
                 Err(_) => Err(Error::ReadError),
             },
             Err(_) => Err(Error::Timeout),
         }
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown_token.cancel();
+        self.shutdown_tracker.wait().await;
     }
 }

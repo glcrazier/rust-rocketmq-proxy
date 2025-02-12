@@ -102,6 +102,18 @@ impl Command {
             body: Some(data[8 + header_length as usize..total_length as usize].to_vec()),
         })
     }
+
+    pub fn decode_vec(data: Vec<u8>) -> Result<Self, Error> {
+        let length = read_u32(data.as_ref());
+        let header_length = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let header: Header = serde_json::from_slice(&data[8..8 + header_length as usize])
+            .map_err(|e| Error::DecodeCommandError(e.into()))?;
+        let total_length = 4 + length;
+        Ok(Self {
+            header,
+            body: Some(data[8 + header_length as usize..total_length as usize].to_vec()),
+        })
+    }
 }
 
 #[cfg(test)]

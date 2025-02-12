@@ -48,8 +48,8 @@ impl MQClient {
         }
     }
 
-    pub fn start(&mut self) -> Result<(), Error> {
-        let result = Channel::new(&self.addr);
+    pub async fn start(&mut self) -> Result<(), Error> {
+        let result = Channel::new(&self.addr).await;
         match result {
             Ok(channel) => {
                 self.channel = Some(channel);
@@ -87,6 +87,12 @@ impl MQClient {
             }
         } else {
             Err(Error::InternalError(anyhow!("channel is not ready")))
+        }
+    }
+
+    pub async fn shutdown(self) {
+        if let Some(channel) = self.channel.as_ref() {
+            channel.shutdown().await;
         }
     }
 }

@@ -9,4 +9,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-tokio-util.workspace = true
+tokio-util = {workspace = true, features = ["rt"]}
+parking_lot.workspace = true
