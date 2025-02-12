@@ -14,12 +14,12 @@ pub enum Error {
     Timeout,
     #[error("read from server error")]
     ReadError,
-    #[error("write to server error")]
-    WriteError,
+    #[error("write to server error: {0}")]
+    WriteError(anyhow::Error),
     #[error("not available currently")]
     TryLater,
     #[error("internal error: {0}")]
-    InternalError(#[from] anyhow::Error)
+    InternalError(anyhow::Error)
 }
 
 pub fn read_u32(data: &[u8]) -> u32 {

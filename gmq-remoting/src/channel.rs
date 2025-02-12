@@ -195,7 +195,7 @@ impl Channel {
         let _ = writer
             .write_all(&mut raw_data)
             .await
-            .map_err(|e| Error::WriteError)?;
+            .map_err(|e| Error::WriteError(e.into()))?;
         Ok(())
     }
 
@@ -203,8 +203,8 @@ impl Channel {
         let (response_tx, response_rx) = oneshot::channel();
         let request = Request { cmd, response_tx };
         let result = self.command_sender.try_send(request);
-        if let Err(_) = result {
-            return Err(Error::WriteError);
+        if let Err(e) = result {
+            return Err(Error::WriteError(e.into()));
         }
         match timeout(self.timeout, response_rx).await {
             Ok(response) => match response {
