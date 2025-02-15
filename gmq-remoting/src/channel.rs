@@ -2,14 +2,10 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
+    io::{AsyncReadExt, AsyncWriteExt}, net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpSocket, TcpStream,
-    },
-    select,
-    sync::{mpsc, oneshot},
-    time::timeout,
+    }, select, sync::{mpsc, oneshot}, task::{block_in_place, spawn_blocking}, time::timeout
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -80,6 +76,7 @@ impl Channel {
 
         let response_table_for_reader = Arc::clone(&response_table);
         let shutdown_token_2 = token.clone();
+        let create_stream_tx_2 = create_stream_tx.clone();
 
         task_tracker.spawn(async move {
             loop {
@@ -139,6 +136,8 @@ impl Channel {
                                         }
                                         Err(e) => {
                                             let _ = request.response_tx.send(Err(e));
+                                            let _x = create_stream_tx_2.send(()).await;
+                                            break;
                                         }
                                     }
                                 }
@@ -156,7 +155,7 @@ impl Channel {
                 }
             }
         });
-        
+
         task_tracker.close();
 
         Ok(Self {
@@ -220,4 +219,11 @@ impl Channel {
         self.shutdown_token.cancel();
         self.shutdown_tracker.wait().await;
     }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.shutdown_token.cancel();
+    }
+    
 }

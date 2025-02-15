@@ -1,15 +1,19 @@
-use crate::pb;
-
-use super::topic_config::TopicConfigManager;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use crate::{common::Error, remoting::client::TopicRouteData};
 
 pub struct RouteService {
-    topic_config_manager: Arc<RwLock<TopicConfigManager>>,
+    topic_route_cache: Arc<RwLock<HashMap<String, TopicRouteData>>>,
 }
 
-pub struct Route {}
-
 impl RouteService {
-    pub fn get_topic_route(&self, topic_name: &str) {}
+    pub fn new() -> Self {
+        Self {
+            topic_route_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    pub async fn load_route(&self, topic_name: &str) -> Result<TopicRouteData, Error> {
+        Ok(TopicRouteData::default())
+    }
 }
