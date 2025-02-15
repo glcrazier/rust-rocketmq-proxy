@@ -32,7 +32,7 @@ pub struct BrokerData {
     broker_addrs: HashMap<i64, String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TopicRouteData {
     #[serde(alias = "queueDatas")]
     queue_datas: Vec<QueueData>,
